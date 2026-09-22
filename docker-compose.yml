@@ -1,0 +1,17 @@
+services:
+  api:
+    build: .
+    ports:
+      - "6422:6422"
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+      - ./calibration:/app/calibration
+    # Uncomment to use a GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
