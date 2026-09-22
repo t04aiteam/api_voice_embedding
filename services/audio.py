@@ -3,6 +3,7 @@
 wav/flac/ogg decode natively via libsndfile; mp3/m4a fall back to librosa's
 audioread backend, which requires ffmpeg to be installed on the host.
 """
+
 import asyncio
 import io
 import os
@@ -12,6 +13,10 @@ import numpy as np
 from fastapi import HTTPException, UploadFile
 
 MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "1"))
+# Activation memory grows linearly with duration (measured 7.6 MiB per second
+# of audio, so a 6-minute song needs about 2.9 GB, see README "Memory"), so cap
+# it. 0 disables the cap.
+MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "600"))
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
 
 
@@ -34,6 +39,14 @@ def _decode(raw: bytes) -> tuple[np.ndarray, int, float]:
             detail=(
                 f"Audio too short: {duration:.2f}s "
                 f"(minimum {MIN_AUDIO_SECONDS}s required)."
+            ),
+        )
+    if MAX_AUDIO_SECONDS > 0 and duration > MAX_AUDIO_SECONDS:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Audio too long: {duration:.2f}s "
+                f"(maximum {MAX_AUDIO_SECONDS:g}s allowed, see MAX_AUDIO_SECONDS)."
             ),
         )
     return waveform, sample_rate, duration

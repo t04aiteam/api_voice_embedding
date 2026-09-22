@@ -48,7 +48,12 @@ and set `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` in `.env`.
 | `HOST` | No | `0.0.0.0` | Bind address |
 | `PORT` | No | `6422` | Bind port |
 | `MIN_AUDIO_SECONDS` | No | `1` | Minimum accepted recording length |
+| `MAX_AUDIO_SECONDS` | No | `600` | Maximum accepted recording length, `0` disables the cap (see Memory) |
 | `MAX_UPLOAD_MB` | No | `25` | Maximum accepted upload size |
+| `CPU_FALLBACK_ON_OOM` | No | `1` | After a CUDA OOM and one retry, run the request on a CPU copy of the model instead of failing |
+| `OOM_RETRY_AFTER_SECONDS` | No | `10` | `Retry-After` value sent with 503 responses |
+| `PYTORCH_CUDA_ALLOC_CONF` | No | `expandable_segments:True` | CUDA allocator config, set before the first CUDA call |
+| `LOG_LEVEL` | No | `INFO` | Python logging level |
 | `DEFAULT_THRESHOLD` | No | `0.70` | Default similarity threshold |
 | `SPEAKER_DATA_DIR` | No | `data/speakers` | Where enrolled embeddings are stored |
 | `CALIBRATION_PATH` | No | `calibration/mean_embedding.npy` | Background mean vector used to center scores |
@@ -135,19 +140,57 @@ curl -X POST http://localhost:6422/embed \
 | 400 | Cannot decode audio / empty file | Check file format (native: wav/flac/ogg; mp3/m4a need ffmpeg) |
 | 404 | Speaker not enrolled | Enroll first via `/speakers/enroll` |
 | 413 | File exceeds `MAX_UPLOAD_MB` (25 MB default) | Trim the recording |
-| 422 | Audio shorter than `MIN_AUDIO_SECONDS` (1s), invalid `speaker_id`, or invalid `threshold` | Use a ≥1s recording; use a valid `speaker_id`/`threshold` |
-| 500 | Server error | Check the service's terminal/log output |
+| 422 | Audio shorter than `MIN_AUDIO_SECONDS` (1s) or longer than `MAX_AUDIO_SECONDS` (600s), invalid `speaker_id`, or invalid `threshold` | Use a 1s to 600s recording; use a valid `speaker_id`/`threshold` |
+| 503 | Out of memory on the inference device (`Retry-After` header set) | Retry after `Retry-After` seconds, send a shorter recording, or free GPU memory held by other processes |
+| 500 | Server error | Check the service's terminal/log output (the response only names the exception type) |
+
+## Memory
+
+Activation memory grows linearly with recording length: measured **7.6 MiB per
+second of audio** (fp32, CPU; the GPU figure is the same order), so a 6-minute
+song needs about 2.9 GB on top of the ~50 MB model. `/compare` embeds its two
+files one after the other, so its peak is the longer file, not the sum.
+
+When the GPU is shared with other jobs the free memory can drop to a few
+hundred MiB at any moment. The service handles that as follows:
+
+1. Inference is serialized (one forward pass at a time), so concurrent requests
+   queue instead of multiplying peak memory.
+2. On CUDA OOM the caching allocator is flushed and the forward pass retried once.
+3. If it still fails and `CPU_FALLBACK_ON_OOM=1` (default), the request runs on
+   a CPU copy of the model (created on first use, ~50 MB RAM; a 6-minute file
+   takes ~2.6 s on CPU).
+4. Otherwise the client gets **503** with `Retry-After` and
+   `{"detail", "retry_after_seconds"}`. A CPU (host RAM) exhaustion also maps to 503.
+
+`MAX_AUDIO_SECONDS` (default 600) rejects recordings that would need more than
+~4.6 GB of activations with a 422 before any inference runs. Set it to `0` to
+disable the cap.
+
+## Tests and evals
+
+```bash
+# Gate tests (no model, no GPU, ~3 s)
+python -m unittest discover -s tests -v
+
+# Memory-pressure eval against a running service (real model):
+# N concurrent /compare calls with a long recording; every response must be
+# 200 or 503, never 500, and at least --min-success of them 200.
+python evals/eval_oom.py /path/to/long.mp3 --url http://localhost:6422 --concurrency 4 --rounds 2
+```
 
 ## Project layout
 
 ```
-main.py                          FastAPI app entrypoint + lifespan model warm-up
+main.py                          FastAPI app entrypoint, lifespan model warm-up, error handlers
 routes/voice.py                  /embed, /compare, /speakers... endpoints
-services/model.py                Model + processor loading, embedding extraction
+services/model.py                Model + processor loading, embedding extraction, OOM retry/fallback
 services/calibration.py          Mean-centering + cosine similarity
-services/audio.py                Upload validation & audio decoding
+services/audio.py                Upload validation & audio decoding (length caps)
 services/store.py                Enrolled-speaker persistence (data/speakers/)
 calibration/mean_embedding.npy   Background mean vector used to center scores
 scripts/calibrate.py             Recompute the calibration vector from real audio
 schemas/voice.py                 Pydantic request/response models
+tests/test_oom.py                Gate tests for OOM retry, CPU fallback, 503/500 mapping, length cap
+evals/eval_oom.py                Memory-pressure eval against a live service
 ```
