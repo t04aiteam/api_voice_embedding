@@ -158,14 +158,15 @@ hundred MiB at any moment. The service handles that as follows:
    queue instead of multiplying peak memory.
 2. On CUDA OOM the caching allocator is flushed and the forward pass retried once.
 3. If it still fails and `CPU_FALLBACK_ON_OOM=1` (default), the request runs on
-   a CPU copy of the model (created on first use, ~50 MB RAM; a 6-minute file
-   takes ~2.6 s on CPU).
+   a CPU copy of the model (loaded once from the local model cache, never
+   deep-copied through the GPU, ~50 MB RAM; a 6-minute file takes ~2.6 s on CPU).
 4. Otherwise the client gets **503** with `Retry-After` and
    `{"detail", "retry_after_seconds"}`. A CPU (host RAM) exhaustion also maps to 503.
 
 `MAX_AUDIO_SECONDS` (default 600) rejects recordings that would need more than
-~4.6 GB of activations with a 422 before any inference runs. Set it to `0` to
-disable the cap.
+~4.6 GB of activations with a 422 before any inference runs. The decoder stops
+reading one second past the cap, so an over-long upload is not decoded in full
+first. Set it to `0` to disable the cap.
 
 ## Tests and evals
 

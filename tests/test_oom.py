@@ -16,6 +16,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+import librosa
 import numpy as np
 import soundfile as sf
 import torch
@@ -96,17 +97,17 @@ class FakeModel:
         return self
 
     def __deepcopy__(self, memo):
-        """Build the CPU copy the fallback path creates, with its own call log.
+        """Fail: deep-copying the CUDA model would allocate its weights on the GPU.
 
         Args:
             memo: deepcopy memo dict, unused.
 
-        Returns:
-            A fresh FakeModel that never fails.
+        Raises:
+            AssertionError: Always, the fallback must load from the cache instead.
         """
-        clone = FakeModel(failures=0, exc=self.exc, delay=self.delay)
-        clone.device = self.device
-        return clone
+        raise AssertionError(
+            "copy.deepcopy(model) allocates on the GPU that just ran out of memory"
+        )
 
     def __call__(self, **kwargs):
         """Run one fake forward pass.
@@ -170,10 +171,20 @@ class ModelServiceState:
         self.device = device
         self.fallback = fallback
         self.release_calls = 0
+        self.release_inside_except = 0
+        self.cache_loads = 0
         self._patches = []
 
     def _count_release(self):
         self.release_calls += 1
+        # Inside an except block the failed pass's traceback (and its CUDA
+        # tensors) is still alive, so a flush there frees nothing useful.
+        if sys.exc_info()[0] is not None:
+            self.release_inside_except += 1
+
+    def _load_from_cache(self):
+        self.cache_loads += 1
+        return FakeModel(failures=0, exc=self.model.exc, delay=self.model.delay)
 
     def __enter__(self):
         """Apply the patches.
@@ -189,6 +200,9 @@ class ModelServiceState:
             mock.patch.object(model_service, "CPU_FALLBACK_ON_OOM", self.fallback),
             mock.patch.object(
                 model_service, "_release_cuda_cache", self._count_release
+            ),
+            mock.patch.object(
+                model_service, "_load_pretrained_model", self._load_from_cache
             ),
         ]
         for p in self._patches:
@@ -243,6 +257,42 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
         self.assertEqual(cpu_copy.device, "cpu")
         self.assertEqual(cpu_copy.calls, ["cpu", "cpu"])
         self.assertEqual(st.release_calls, 4)
+        self.assertEqual(st.cache_loads, 1)
+
+    def test_cpu_copy_is_loaded_from_cache_not_deepcopied(self):
+        # FakeModel.__deepcopy__ raises: deep-copying a CUDA module clones the
+        # weights on the GPU that just ran out of memory (9540308 did that).
+        model = FakeModel(failures=2)
+        with ModelServiceState(model) as st:
+            out = model_service.extract_embedding(WAVE, 16000)
+        self.assertEqual(out.shape, (model_service.EMBEDDING_DIM,))
+        self.assertEqual(st.cache_loads, 1)
+
+    def test_cache_flush_runs_outside_the_except_block(self):
+        # Inside the except block the traceback keeps the failed pass's CUDA
+        # tensors alive, so empty_cache() there cannot return them.
+        model = FakeModel(failures=2)
+        with ModelServiceState(model, fallback=False) as st:
+            with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
+                model_service.extract_embedding(WAVE, 16000)
+        self.assertEqual(st.release_calls, 2)
+        self.assertEqual(st.release_inside_except, 0)
+        self.assertIsNone(ctx.exception.cause.__traceback__)
+
+    def test_cublas_alloc_failure_counts_as_cuda_oom(self):
+        # On a full GPU cuBLAS handle creation fails with a plain RuntimeError,
+        # not torch.OutOfMemoryError; it must take the retry/fallback path.
+        exc = RuntimeError(
+            "CUDA error: CUBLAS_STATUS_ALLOC_FAILED when calling `cublasCreate(handle)`"
+        )
+        model = FakeModel(failures=2, exc=exc)
+        with ModelServiceState(model) as st:
+            out = model_service.extract_embedding(WAVE, 16000)
+            cpu_calls = list(model_service._cpu_model.calls)
+        self.assertEqual(out.shape, (model_service.EMBEDDING_DIM,))
+        self.assertEqual(model.calls, ["cuda", "cuda"])
+        self.assertEqual(st.release_calls, 2)
+        self.assertEqual(cpu_calls, ["cpu"])
 
     def test_double_oom_without_fallback_raises_503_error(self):
         model = FakeModel(failures=2)
@@ -262,13 +312,30 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
         self.assertEqual(ctx.exception.device, "cpu")
 
     def test_torch_cpu_allocator_error_maps_to_cpu_oom(self):
-        exc = RuntimeError(
-            "[enforce fail at alloc_cpu.cpp:117] DefaultCPUAllocator: not enough memory"
+        # Both wordings torch has used; emb-env's torch 2.13 emits the second
+        # (checked with strings on libc10.so), which 9540308 did not match.
+        messages = (
+            "[enforce fail at alloc_cpu.cpp:117] DefaultCPUAllocator: not enough memory",
+            "[enforce fail at alloc_cpu.cpp:121] DefaultCPUAllocator: can't allocate "
+            "memory: you tried to allocate 2999999488 bytes.",
         )
-        model = FakeModel(failures=1, exc=exc)
-        with ModelServiceState(model, device="cpu"):
-            with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
-                model_service.extract_embedding(WAVE, 16000)
+        for message in messages:
+            model = FakeModel(failures=1, exc=RuntimeError(message))
+            with ModelServiceState(model, device="cpu"):
+                with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
+                    model_service.extract_embedding(WAVE, 16000)
+            self.assertEqual(ctx.exception.device, "cpu", message)
+
+    def test_torch_cpu_allocator_error_during_fallback_is_503_not_500(self):
+        cpu_exc = RuntimeError(
+            "DefaultCPUAllocator: can't allocate memory: you tried to allocate 1 bytes."
+        )
+        model = FakeModel()
+        with ModelServiceState(model):
+            with mock.patch.object(model_service, "_forward") as fwd:
+                fwd.side_effect = [OOM("a"), OOM("b"), cpu_exc]
+                with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
+                    model_service.extract_embedding(WAVE, 16000)
         self.assertEqual(ctx.exception.device, "cpu")
 
     def test_fallback_cpu_oom_reports_cpu(self):
@@ -342,8 +409,25 @@ class AudioLengthCapTests(unittest.TestCase):
 
     def test_zero_disables_cap(self):
         with mock.patch.object(audio_service, "MAX_AUDIO_SECONDS", 0):
-            wave, sr, duration = audio_service._decode(wav_bytes(2.0))
+            with mock.patch.object(
+                audio_service.librosa, "load", wraps=librosa.load
+            ) as spy:
+                wave, sr, duration = audio_service._decode(wav_bytes(2.0))
         self.assertAlmostEqual(duration, 2.0, places=3)
+        self.assertIsNone(spy.call_args.kwargs["duration"])
+
+    def test_decoder_stops_one_second_past_the_cap(self):
+        # A 25 MB mp3 holds ~30 minutes; without the bound the whole file is
+        # decoded to float32 (seconds of CPU) just to be rejected.
+        with mock.patch.object(audio_service, "MAX_AUDIO_SECONDS", 1.5):
+            with mock.patch.object(
+                audio_service.librosa, "load", wraps=librosa.load
+            ) as spy:
+                with self.assertRaises(HTTPException) as ctx:
+                    audio_service._decode(wav_bytes(10.0))
+        self.assertEqual(ctx.exception.status_code, 422)
+        self.assertEqual(spy.call_args.kwargs["duration"], 2.5)
+        self.assertIn("more than 1.5s", ctx.exception.detail)
 
 
 class HttpErrorMappingTests(unittest.TestCase):

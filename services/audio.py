@@ -23,8 +23,13 @@ MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
 def _decode(raw: bytes) -> tuple[np.ndarray, int, float]:
     if not raw:
         raise HTTPException(status_code=400, detail="Empty file / cannot decode audio.")
+    # Stop decoding just past the cap: a 25 MB mp3 can hold 30 minutes, and
+    # decoding all of it to float32 only to reject it costs seconds of CPU.
+    limit = MAX_AUDIO_SECONDS + 1 if MAX_AUDIO_SECONDS > 0 else None
     try:
-        waveform, sample_rate = librosa.load(io.BytesIO(raw), sr=None, mono=True)
+        waveform, sample_rate = librosa.load(
+            io.BytesIO(raw), sr=None, mono=True, duration=limit
+        )
     except Exception as exc:
         raise HTTPException(
             status_code=400,
@@ -45,7 +50,7 @@ def _decode(raw: bytes) -> tuple[np.ndarray, int, float]:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"Audio too long: {duration:.2f}s "
+                f"Audio too long: more than {MAX_AUDIO_SECONDS:g}s "
                 f"(maximum {MAX_AUDIO_SECONDS:g}s allowed, see MAX_AUDIO_SECONDS)."
             ),
         )

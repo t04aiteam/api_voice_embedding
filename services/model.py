@@ -10,12 +10,13 @@ drop to almost nothing at any time):
    activations, never N concurrent requests' worth.
 2. On CUDA OOM the cached allocator is flushed and the forward pass retried once.
 3. If it still fails and CPU_FALLBACK_ON_OOM is on (default), the request runs
-   on a lazily created CPU copy of the model (~12M parameters, ~50 MB RAM).
+   on a CPU copy of the model (~12M parameters, ~50 MB RAM) loaded once from the
+   local model cache. The copy never touches the GPU: deep-copying a CUDA model
+   would allocate the weights on the GPU that just ran out of memory.
 4. If the fallback is off, or the CPU itself runs out of memory,
    InferenceOutOfMemory is raised and main.py turns it into HTTP 503.
 """
 
-import copy
 import logging
 import os
 import threading
@@ -47,12 +48,30 @@ CPU_FALLBACK_ON_OOM = os.getenv("CPU_FALLBACK_ON_OOM", "1").strip().lower() in (
 # older name and is kept as an alias in newer releases.
 CudaOutOfMemoryError = getattr(torch, "OutOfMemoryError", torch.cuda.OutOfMemoryError)
 
+# torch's CPU allocator raises a plain RuntimeError and the wording changed
+# across releases: "DefaultCPUAllocator: not enough memory" (older) and
+# "DefaultCPUAllocator: can't allocate memory" (2.13 in emb-env, checked with
+# strings on libc10.so).
+_CPU_OOM_MARKERS = ("not enough memory", "can't allocate memory")
+# Besides torch.OutOfMemoryError, a starved GPU surfaces as a plain RuntimeError
+# when a library handle cannot be created (cuBLAS/cuDNN *_ALLOC_FAILED) or a raw
+# driver call fails ("CUDA error: out of memory").
+_CUDA_OOM_MARKERS = (
+    "CUDA out of memory",
+    "CUDA error: out of memory",
+    "CUBLAS_STATUS_ALLOC_FAILED",
+    "CUDNN_STATUS_ALLOC_FAILED",
+)
+
 _device: str | None = None
 _processor = None
 _model = None
 _cpu_model = None
 _load_lock = threading.Lock()
 _cpu_model_lock = threading.Lock()
+# ponytail: one global lock, so every request queues behind the running forward
+# pass (2.6 s per 6-minute file on CPU). Bounded semaphore + 503 when the queue
+# is deep if latency under bursts matters.
 _infer_lock = threading.Lock()
 
 
@@ -105,6 +124,21 @@ def _hf_token() -> str | None:
     return token
 
 
+def _load_pretrained_model():
+    """Load the pinned model revision onto the CPU, from the local cache once downloaded.
+
+    Returns:
+        The model in eval mode, on CPU.
+    """
+    model = AutoModel.from_pretrained(
+        MODEL_ID,
+        revision=MODEL_REVISION,
+        trust_remote_code=True,
+        token=_hf_token(),
+    )
+    return model.eval()
+
+
 def load_model():
     """Load the processor + model once. Safe to call repeatedly (idempotent).
 
@@ -118,22 +152,13 @@ def load_model():
         if _model is not None:
             return _model, _processor
         device = resolve_device()
-        hf_token = _hf_token()
         _processor = AutoProcessor.from_pretrained(
             MODEL_ID,
             revision=MODEL_REVISION,
             trust_remote_code=True,
-            token=hf_token,
+            token=_hf_token(),
         )
-        model = AutoModel.from_pretrained(
-            MODEL_ID,
-            revision=MODEL_REVISION,
-            trust_remote_code=True,
-            token=hf_token,
-        )
-        model.eval()
-        model.to(device)
-        _model = model
+        _model = _load_pretrained_model().to(device)
         return _model, _processor
 
 
@@ -156,7 +181,12 @@ def get_processor():
 
 
 def _get_cpu_model():
-    """Return a CPU copy of the loaded model, creating it on first use.
+    """Return a CPU copy of the loaded model, loading it on first use.
+
+    The copy is re-read from the local model cache (same pinned revision, so the
+    weights are identical) instead of deep-copied: ``copy.deepcopy`` of a CUDA
+    module clones every parameter on the GPU first, and that is the device that
+    just ran out of memory.
 
     Returns:
         The model on CPU. If the main model already lives on CPU it is returned as is.
@@ -169,8 +199,8 @@ def _get_cpu_model():
         return _cpu_model
     with _cpu_model_lock:
         if _cpu_model is None:
-            logger.warning("Creating CPU fallback copy of the model after CUDA OOM.")
-            _cpu_model = copy.deepcopy(model).to("cpu").eval()
+            logger.warning("Loading CPU fallback copy of the model after CUDA OOM.")
+            _cpu_model = _load_pretrained_model().to("cpu")
         return _cpu_model
 
 
@@ -197,21 +227,37 @@ def _release_cuda_cache() -> None:
         torch.cuda.empty_cache()
 
 
-def _is_cpu_oom(exc: BaseException) -> bool:
-    """Tell whether an exception is a host-memory exhaustion.
-
-    Python raises MemoryError; torch's CPU allocator raises a RuntimeError whose
-    message says "DefaultCPUAllocator: not enough memory".
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """Tell whether an exception means the GPU ran out of memory.
 
     Args:
         exc: The exception to classify.
 
     Returns:
-        True if exc means the host ran out of memory.
+        True for torch.OutOfMemoryError and for a RuntimeError carrying a CUDA
+        allocation failure message.
+    """
+    if isinstance(exc, CudaOutOfMemoryError):
+        return True
+    return isinstance(exc, RuntimeError) and any(
+        m in str(exc) for m in _CUDA_OOM_MARKERS
+    )
+
+
+def _is_cpu_oom(exc: BaseException) -> bool:
+    """Tell whether an exception is a host-memory exhaustion.
+
+    Args:
+        exc: The exception to classify.
+
+    Returns:
+        True for MemoryError and for torch's CPU allocator RuntimeError.
     """
     if isinstance(exc, MemoryError):
         return True
-    return isinstance(exc, RuntimeError) and "not enough memory" in str(exc)
+    return isinstance(exc, RuntimeError) and any(
+        m in str(exc) for m in _CPU_OOM_MARKERS
+    )
 
 
 def _forward_cpu_fallback(inputs: dict) -> np.ndarray:
@@ -252,20 +298,26 @@ def extract_embedding(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
     device = resolve_device()
     inputs = processor(waveform, sampling_rate=sample_rate)
     with _infer_lock:
-        try:
-            return _forward(model, inputs, device)
-        except CudaOutOfMemoryError:
-            logger.warning("CUDA OOM on %s, flushing cache and retrying once.", device)
+        cause = None
+        for attempt in (1, 2):
+            try:
+                return _forward(model, inputs, device)
+            except (MemoryError, RuntimeError) as err:
+                if _is_cuda_oom(err):
+                    # Drop the traceback: it pins the failed pass's frames and
+                    # their CUDA tensors, which must be gone before the flush.
+                    cause = err.with_traceback(None)
+                elif _is_cpu_oom(err):
+                    raise InferenceOutOfMemory(device, err) from err
+                else:
+                    raise
+            # Outside the except block, so the flush sees the freed activations.
             _release_cuda_cache()
-        except (MemoryError, RuntimeError) as err:
-            if _is_cpu_oom(err):
-                raise InferenceOutOfMemory(device, err) from err
-            raise
-        try:
-            return _forward(model, inputs, device)
-        except CudaOutOfMemoryError as second:
-            _release_cuda_cache()
-            if not CPU_FALLBACK_ON_OOM:
-                raise InferenceOutOfMemory(device, second) from second
-            logger.warning("CUDA OOM again, running this request on CPU.")
+            if attempt == 1:
+                logger.warning(
+                    "CUDA OOM on %s, flushed the cache, retrying once.", device
+                )
+        if not CPU_FALLBACK_ON_OOM:
+            raise InferenceOutOfMemory(device, cause) from cause
+        logger.warning("CUDA OOM again, running this request on CPU.")
         return _forward_cpu_fallback(inputs)

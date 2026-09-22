@@ -8,19 +8,27 @@ Recommended: >= 5 recordings, ideally 20+ distinct speakers, covering the
 range of voices/recording conditions this deployment will see. Restart the
 service after recalibrating so it picks up the new vector.
 """
+
 import argparse
 import os
 import sys
 
 import librosa
 import numpy as np
+from dotenv import load_dotenv
+
+# Same settings as the server (MODEL_ID, MODEL_REVISION, DEVICE, ...), otherwise
+# the calibration vector could come from a different model than the one serving.
+load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"), override=False)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from services import model as model_service  # noqa: E402
 
 AUDIO_EXTENSIONS = {".wav", ".flac", ".ogg", ".mp3", ".m4a"}
-DEFAULT_OUTPUT = os.path.join(os.path.dirname(__file__), "..", "calibration", "mean_embedding.npy")
+DEFAULT_OUTPUT = os.path.join(
+    os.path.dirname(__file__), "..", "calibration", "mean_embedding.npy"
+)
 
 
 def iter_audio_files(input_dir: str):
