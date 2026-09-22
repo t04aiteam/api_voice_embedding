@@ -13,7 +13,11 @@ drop to almost nothing at any time):
    on a CPU copy of the model (~12M parameters, ~50 MB RAM) loaded once from the
    local model cache. The copy never touches the GPU: deep-copying a CUDA model
    would allocate the weights on the GPU that just ran out of memory.
-4. If the fallback is off, or the CPU itself runs out of memory,
+4. Before any CPU pass (fallback or DEVICE=cpu) the activation memory is
+   estimated from the processor output and checked against MemAvailable, so a
+   recording that cannot fit in host RAM fails as one request instead of
+   feeding the kernel's OOM killer on a shared box.
+5. If the fallback is off, or the CPU itself runs out of memory,
    InferenceOutOfMemory is raised and main.py turns it into HTTP 500 whose
    detail says "out of memory" (the HDSD manual documents 500 only).
 """
@@ -22,13 +26,9 @@ import logging
 import os
 import threading
 
-# Must be set before the CUDA allocator is initialised (first CUDA call), so
-# a value from the environment or .env wins and this is only the default.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
-import numpy as np  # noqa: E402
-import torch  # noqa: E402
-from transformers import AutoModel, AutoProcessor  # noqa: E402
+import numpy as np
+import torch
+from transformers import AutoModel, AutoProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +205,57 @@ def _get_cpu_model():
         return _cpu_model
 
 
+# Activation memory of one CPU forward pass per byte of processor output.
+# Measured on 222 (fp32, 80 threads, probe_pass2.log): 157, 159 and 160 for
+# 60 s, 378 s and 756 s of audio, so it is linear in the recording length.
+# ponytail: one constant from one box and one model revision; re-measure
+# with probe_pass2.py if MODEL_ID changes.
+_CPU_ACTIVATION_BYTES_PER_INPUT_BYTE = 160
+
+
+def _host_memory_available() -> int | None:
+    """Read MemAvailable from /proc/meminfo.
+
+    Returns:
+        Bytes the kernel expects to be usable without swapping, or None when
+        /proc/meminfo cannot be read (non-Linux).
+    """
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _check_host_memory(inputs: dict) -> None:
+    """Refuse a CPU forward pass whose activations would not fit in host RAM.
+
+    The pass allocates one activation tensor at a time and the kernel accepts
+    each of them, so without this check an over-long recording drives the
+    host into swap and the OOM killer ends this process or a neighbour's,
+    instead of one request failing.
+
+    Args:
+        inputs: Processor output.
+
+    Raises:
+        MemoryError: If the estimated activation memory exceeds MemAvailable.
+    """
+    available = _host_memory_available()
+    if available is None:
+        return
+    input_bytes = sum(int(getattr(v, "nbytes", 0)) for v in inputs.values())
+    needed = input_bytes * _CPU_ACTIVATION_BYTES_PER_INPUT_BYTE
+    if needed > available:
+        raise MemoryError(
+            f"CPU forward pass needs about {needed >> 20} MiB of activations, "
+            f"{available >> 20} MiB available"
+        )
+
+
 def _forward(model, inputs: dict, device: str) -> np.ndarray:
     """Run one forward pass on device and return the embedding as float32.
 
@@ -216,6 +267,8 @@ def _forward(model, inputs: dict, device: str) -> np.ndarray:
     Returns:
         The raw embedding as a float32 numpy array.
     """
+    if device == "cpu":
+        _check_host_memory(inputs)
     moved = {k: (v.to(device) if hasattr(v, "to") else v) for k, v in inputs.items()}
     with torch.no_grad():
         output = model(**moved).last_hidden_state

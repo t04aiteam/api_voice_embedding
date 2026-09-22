@@ -51,7 +51,7 @@ and set `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1` in `.env`.
 | `MAX_AUDIO_SECONDS` | No | `0` | Optional maximum recording length in seconds, `0` (default) means no cap (see Memory) |
 | `MAX_UPLOAD_MB` | No | `25` | Maximum accepted upload size |
 | `CPU_FALLBACK_ON_OOM` | No | `1` | After a CUDA OOM and one retry, run the request on a CPU copy of the model instead of failing |
-| `PYTORCH_CUDA_ALLOC_CONF` | No | `expandable_segments:True` | CUDA allocator config, set before the first CUDA call |
+| `PYTORCH_CUDA_ALLOC_CONF` | No | unset | Optional torch CUDA allocator config, passed through as is; the service does not set it |
 | `LOG_LEVEL` | No | `INFO` | Python logging level |
 | `DEFAULT_THRESHOLD` | No | `0.70` | Default similarity threshold |
 | `SPEAKER_DATA_DIR` | No | `data/speakers` | Where enrolled embeddings are stored |
@@ -158,7 +158,13 @@ hundred MiB at any moment. The service handles that as follows:
 3. If it still fails and `CPU_FALLBACK_ON_OOM=1` (default), the request runs on
    a CPU copy of the model (loaded once from the local model cache, never
    deep-copied through the GPU, ~50 MB RAM; a 6-minute file takes ~2.6 s on CPU).
-4. Otherwise the client gets **500** with a `detail` that starts with
+4. Before any CPU pass (fallback or `DEVICE=cpu`) the activation memory is
+   estimated from the processor output (160 bytes per input byte, measured)
+   and compared with `MemAvailable` from `/proc/meminfo`. A recording that
+   would not fit is refused as an out-of-memory 500 instead of driving the
+   host into swap and the kernel OOM killer. Skipped where `/proc/meminfo`
+   does not exist.
+5. Otherwise the client gets **500** with a `detail` that starts with
    `Server out of memory on <device>` (the HDSD manual documents 500 as the
    only server error). A CPU (host RAM) exhaustion maps the same way.
 

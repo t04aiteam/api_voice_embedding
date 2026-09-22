@@ -27,9 +27,15 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from fastapi import HTTPException  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
+# Imported before main (which loads .env) so the snapshot pair isolates what
+# the model module itself does to the CUDA allocator setting.
+_ALLOC_CONF_BEFORE_IMPORT = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+from services import model as model_service  # noqa: E402
+
+_ALLOC_CONF_AFTER_IMPORT = os.environ.get("PYTORCH_CUDA_ALLOC_CONF")
+
 import main  # noqa: E402
 from services import audio as audio_service  # noqa: E402
-from services import model as model_service  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "evals"))
 import eval_oom  # noqa: E402
@@ -377,10 +383,10 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
         self.assertEqual(len(model.calls), 4)
         self.assertEqual(model.max_active, 1)
 
-    def test_alloc_conf_default_is_expandable_segments(self):
-        self.assertIn(
-            "expandable_segments", os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
-        )
+    def test_import_does_not_change_cuda_alloc_conf(self):
+        # The service must not switch the CUDA allocator process-wide; the
+        # reported OOM had 28 MiB reserved-but-unallocated, not fragmentation.
+        self.assertEqual(_ALLOC_CONF_AFTER_IMPORT, _ALLOC_CONF_BEFORE_IMPORT)
 
     def test_hf_token_ignores_blank_and_dotenv_comment(self):
         cases = {
@@ -394,6 +400,102 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
                 self.assertEqual(model_service._hf_token(), expected, raw)
         with mock.patch.dict(os.environ, {}, clear=True):
             self.assertIsNone(model_service._hf_token())
+
+
+class FakeFeatures:
+    """Tensor stand-in with a size and a no-op device move, so no test touches a GPU."""
+
+    def __init__(self, nbytes):
+        """Set the byte size the guard will read.
+
+        Args:
+            nbytes: Value reported as the tensor's nbytes.
+        """
+        self.nbytes = nbytes
+
+    def to(self, device):
+        """Pretend to move to device.
+
+        Args:
+            device: Ignored.
+
+        Returns:
+            This object.
+        """
+        return self
+
+
+class TensorProcessor:
+    """Processor stand-in whose output has a size, as 1000 float32 frames of 128 would."""
+
+    NBYTES = 1000 * 128 * 4
+
+    def __call__(self, waveform, sampling_rate=None):
+        """Return one sized feature object.
+
+        Args:
+            waveform: Ignored.
+            sampling_rate: Ignored.
+
+        Returns:
+            A dict with one FakeFeatures value.
+        """
+        return {"input_values": FakeFeatures(self.NBYTES)}
+
+
+class HostMemoryGuardTests(unittest.TestCase):
+    """A CPU pass that cannot fit in host RAM fails as one request, never as an OOM kill."""
+
+    NEEDED = TensorProcessor.NBYTES * model_service._CPU_ACTIVATION_BYTES_PER_INPUT_BYTE
+
+    def _run(self, model, device, available):
+        with ModelServiceState(model, device=device):
+            with mock.patch.object(model_service, "_processor", TensorProcessor()):
+                with mock.patch.object(
+                    model_service, "_host_memory_available", return_value=available
+                ):
+                    return model_service.extract_embedding(WAVE, 16000)
+
+    def test_cpu_pass_is_refused_when_activations_exceed_available(self):
+        model = FakeModel()
+        with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
+            self._run(model, "cpu", self.NEEDED - 1)
+        self.assertEqual(ctx.exception.device, "cpu")
+        self.assertIsInstance(ctx.exception.cause, MemoryError)
+        self.assertEqual(model.calls, [], "no forward pass may start")
+
+    def test_cpu_pass_runs_when_activations_fit(self):
+        model = FakeModel()
+        emb = self._run(model, "cpu", self.NEEDED)
+        self.assertEqual(emb.shape, (model_service.EMBEDDING_DIM,))
+        # FakeModel records its own device label, set by .to() only; on a
+        # DEVICE=cpu service the model is never moved, so count the calls.
+        self.assertEqual(len(model.calls), 1)
+
+    def test_guard_is_skipped_without_proc_meminfo(self):
+        model = FakeModel()
+        emb = self._run(model, "cpu", None)
+        self.assertEqual(emb.shape, (model_service.EMBEDDING_DIM,))
+
+    def test_fallback_after_cuda_oom_is_refused_when_host_is_short(self):
+        model = FakeModel(failures=2)
+        with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
+            self._run(model, "cuda", self.NEEDED - 1)
+        self.assertEqual(ctx.exception.device, "cpu")
+        self.assertEqual(model.calls, ["cuda", "cuda"])
+
+    def test_gpu_pass_is_not_guarded(self):
+        model = FakeModel()
+        emb = self._run(model, "cuda", 0)
+        self.assertEqual(emb.shape, (model_service.EMBEDDING_DIM,))
+        self.assertEqual(model.calls, ["cuda"])
+
+    def test_meminfo_parsing(self):
+        data = "MemTotal:  131072 kB\nMemFree:  10 kB\nMemAvailable:  2048 kB\n"
+        with mock.patch("builtins.open", mock.mock_open(read_data=data)):
+            self.assertEqual(model_service._host_memory_available(), 2048 * 1024)
+        with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIsNone(model_service._host_memory_available())
 
 
 class AudioLengthCapTests(unittest.TestCase):
