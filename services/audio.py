@@ -13,10 +13,10 @@ import numpy as np
 from fastapi import HTTPException, UploadFile
 
 MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "1"))
-# Activation memory grows linearly with duration (measured 7.6 MiB per second
-# of audio, so a 6-minute song needs about 2.9 GB, see README "Memory"), so cap
-# it. 0 disables the cap.
-MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "600"))
+# Optional cap, off by default: the user manual (HDSD) lists 25 MB as the only
+# size limit. Activation memory grows linearly with duration (measured 7.6 MiB
+# per second of audio, see README "Memory"), so a deployment can opt in.
+MAX_AUDIO_SECONDS = float(os.getenv("MAX_AUDIO_SECONDS", "0"))
 MAX_UPLOAD_MB = float(os.getenv("MAX_UPLOAD_MB", "25"))
 
 

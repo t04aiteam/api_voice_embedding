@@ -29,8 +29,6 @@ logging.basicConfig(
 logger = logging.getLogger("voice_api")
 
 MODEL_ID = os.getenv("MODEL_ID", "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B")
-# Seconds a client should wait before retrying after a 503.
-OOM_RETRY_AFTER_SECONDS = int(os.getenv("OOM_RETRY_AFTER_SECONDS", "10"))
 
 
 @asynccontextmanager
@@ -72,14 +70,18 @@ async def health():
 async def out_of_memory_handler(
     request: Request, exc: model_service.InferenceOutOfMemory
 ):
-    """Turn an inference OOM into a retryable 503 with a Retry-After header.
+    """Turn an inference OOM into a 500 whose detail names the cause.
+
+    The user manual (HDSD) documents 500 as the only server error, so OOM keeps
+    that status. The detail says "out of memory" so a client can tell it apart
+    from the generic handler below without reading the service log.
 
     Args:
         request: The failing request.
         exc: The out-of-memory error raised by the model service.
 
     Returns:
-        A 503 JSON response.
+        A 500 JSON response.
     """
     logger.error(
         "%s %s: out of memory on %s (%s)",
@@ -89,14 +91,12 @@ async def out_of_memory_handler(
         type(exc.cause).__name__,
     )
     return JSONResponse(
-        status_code=503,
-        headers={"Retry-After": str(OOM_RETRY_AFTER_SECONDS)},
+        status_code=500,
         content={
             "detail": (
                 f"Server out of memory on {exc.device} while processing this request. "
-                f"Retry in {OOM_RETRY_AFTER_SECONDS}s or send a shorter recording."
-            ),
-            "retry_after_seconds": OOM_RETRY_AFTER_SECONDS,
+                "Retry later or send a shorter recording."
+            )
         },
     )
 

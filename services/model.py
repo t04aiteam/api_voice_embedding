@@ -14,7 +14,8 @@ drop to almost nothing at any time):
    local model cache. The copy never touches the GPU: deep-copying a CUDA model
    would allocate the weights on the GPU that just ran out of memory.
 4. If the fallback is off, or the CPU itself runs out of memory,
-   InferenceOutOfMemory is raised and main.py turns it into HTTP 503.
+   InferenceOutOfMemory is raised and main.py turns it into HTTP 500 whose
+   detail says "out of memory" (the HDSD manual documents 500 only).
 """
 
 import logging
@@ -70,8 +71,8 @@ _cpu_model = None
 _load_lock = threading.Lock()
 _cpu_model_lock = threading.Lock()
 # ponytail: one global lock, so every request queues behind the running forward
-# pass (2.6 s per 6-minute file on CPU). Bounded semaphore + 503 when the queue
-# is deep if latency under bursts matters.
+# pass (2.6 s per 6-minute file on CPU). Bounded semaphore + early 500 when the
+# queue is deep if latency under bursts matters.
 _infer_lock = threading.Lock()
 
 

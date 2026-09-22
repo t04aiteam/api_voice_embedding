@@ -7,6 +7,7 @@ Run:
     emb-env/bin/python -m unittest discover -s tests -v
 """
 
+import importlib
 import io
 import os
 import sys
@@ -29,6 +30,9 @@ from fastapi.testclient import TestClient  # noqa: E402
 import main  # noqa: E402
 from services import audio as audio_service  # noqa: E402
 from services import model as model_service  # noqa: E402
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "evals"))
+import eval_oom  # noqa: E402
 
 OOM = model_service.CudaOutOfMemoryError
 
@@ -294,7 +298,7 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
         self.assertEqual(st.release_calls, 2)
         self.assertEqual(cpu_calls, ["cpu"])
 
-    def test_double_oom_without_fallback_raises_503_error(self):
+    def test_double_oom_without_fallback_raises_oom_error(self):
         model = FakeModel(failures=2)
         with ModelServiceState(model, fallback=False) as st:
             with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
@@ -326,7 +330,7 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
                     model_service.extract_embedding(WAVE, 16000)
             self.assertEqual(ctx.exception.device, "cpu", message)
 
-    def test_torch_cpu_allocator_error_during_fallback_is_503_not_500(self):
+    def test_torch_cpu_allocator_error_during_fallback_is_oom_not_generic(self):
         cpu_exc = RuntimeError(
             "DefaultCPUAllocator: can't allocate memory: you tried to allocate 1 bytes."
         )
@@ -393,7 +397,20 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
 
 
 class AudioLengthCapTests(unittest.TestCase):
-    """MAX_AUDIO_SECONDS rejects recordings that would need too much activation memory."""
+    """MAX_AUDIO_SECONDS is an opt-in cap; off by default as in the HDSD manual."""
+
+    def test_cap_is_off_by_default(self):
+        # The manual lists 25 MB as the only size limit, so a recording of any
+        # length under that must not be rejected unless a deployment opts in.
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MAX_AUDIO_SECONDS", None)
+            importlib.reload(audio_service)
+        try:
+            self.assertEqual(audio_service.MAX_AUDIO_SECONDS, 0.0)
+            wave, sr, duration = audio_service._decode(wav_bytes(20.0))
+            self.assertAlmostEqual(duration, 20.0, places=3)
+        finally:
+            importlib.reload(audio_service)
 
     def test_too_long_is_422(self):
         with mock.patch.object(audio_service, "MAX_AUDIO_SECONDS", 1.5):
@@ -431,7 +448,7 @@ class AudioLengthCapTests(unittest.TestCase):
 
 
 class HttpErrorMappingTests(unittest.TestCase):
-    """main.py handlers: OOM is a 503 with Retry-After, other failures a generic 500."""
+    """main.py handlers: every server error is a 500 (HDSD manual); OOM says so in detail."""
 
     def setUp(self):
         # No context manager: lifespan (real model load) must not run.
@@ -441,25 +458,37 @@ class HttpErrorMappingTests(unittest.TestCase):
             "file_b": ("b.wav", wav_bytes(1.5), "audio/wav"),
         }
 
-    def test_compare_oom_is_503_with_retry_after(self):
+    def test_compare_oom_is_500_naming_the_cause(self):
+        # The manual documents 500 as the only server error, so OOM must not
+        # become a 503; the detail is what tells a client to retry.
         err = model_service.InferenceOutOfMemory(
             "cuda", OOM("CUDA out of memory. Process 6763 has")
         )
         with mock.patch.object(model_service, "extract_embedding", side_effect=err):
             r = self.client.post("/compare", files=self.files)
-        self.assertEqual(r.status_code, 503)
-        self.assertEqual(r.headers["Retry-After"], str(main.OOM_RETRY_AFTER_SECONDS))
+        self.assertEqual(r.status_code, 500)
+        self.assertNotIn("Retry-After", r.headers)
         body = r.json()
+        self.assertEqual(list(body), ["detail"])
         self.assertIn("out of memory on cuda", body["detail"])
-        self.assertEqual(body["retry_after_seconds"], main.OOM_RETRY_AFTER_SECONDS)
         self.assertNotIn("Process", body["detail"])
+        self.assertTrue(eval_oom.is_oom({"status": 500, "detail": body}))
 
-    def test_embed_oom_is_503(self):
+    def test_embed_oom_is_500(self):
         err = model_service.InferenceOutOfMemory("cpu", MemoryError())
         with mock.patch.object(model_service, "extract_embedding", side_effect=err):
             r = self.client.post("/embed", files={"file": self.files["file_a"]})
-        self.assertEqual(r.status_code, 503)
+        self.assertEqual(r.status_code, 500)
         self.assertIn("on cpu", r.json()["detail"])
+
+    def test_eval_tells_oom_500_from_other_500(self):
+        generic = {"status": 500, "detail": {"detail": "Internal server error: X"}}
+        self.assertFalse(eval_oom.is_oom(generic))
+        self.assertFalse(eval_oom.is_oom({"status": 200, "detail": {}}))
+        self.assertFalse(eval_oom.is_oom({"status": "error", "detail": "timeout"}))
+        self.assertTrue(
+            eval_oom.is_oom({"status": 500, "detail": "Server out of memory on cpu"})
+        )
 
     def test_unexpected_error_is_generic_500(self):
         with mock.patch.object(

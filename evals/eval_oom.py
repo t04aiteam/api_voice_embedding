@@ -3,8 +3,10 @@
 
 Fires N concurrent POST /compare calls with the same long recording on both
 sides and checks that the service degrades cleanly: every response must be
-200 (embedded) or 503 (out of memory, retryable). A single 500, timeout or
-connection error fails the eval, and so does a 200 rate below --min-success.
+200 (embedded) or an "out of memory" 500 (the HDSD manual documents 500 as
+the only server error, so OOM keeps that status and is told apart by its
+detail). Any other 500, a timeout or a connection error fails the eval, and so
+does a 200 rate below --min-success.
 
 This exercises the real model, so it runs after deploy and on a schedule, not
 as a pre-commit gate (tests/test_oom.py covers the logic deterministically).
@@ -23,6 +25,22 @@ import sys
 import time
 
 import httpx
+
+OOM_MARKER = "out of memory"
+
+
+def is_oom(res: dict) -> bool:
+    """Tell an out-of-memory 500 apart from any other failure.
+
+    Args:
+        res: One result dict from one_request.
+
+    Returns:
+        True when the status is 500 and the detail names an out-of-memory cause.
+    """
+    detail = res["detail"]
+    text = detail.get("detail", "") if isinstance(detail, dict) else str(detail)
+    return res["status"] == 500 and OOM_MARKER in text.lower()
 
 
 def one_request(url: str, audio: bytes, name: str, timeout: float) -> dict:
@@ -49,14 +67,12 @@ def one_request(url: str, audio: bytes, name: str, timeout: float) -> dict:
         return {
             "status": r.status_code,
             "latency": latency,
-            "retry_after": r.headers.get("Retry-After"),
             "detail": detail,
         }
     except Exception as exc:  # noqa: BLE001 - any transport failure is a hard fail
         return {
             "status": "error",
             "latency": time.perf_counter() - t0,
-            "retry_after": None,
             "detail": f"{type(exc).__name__}: {exc}",
         }
 
@@ -104,19 +120,19 @@ def main() -> int:
                 results.append(res)
                 print(
                     f"round={rnd} slot={i} status={res['status']} "
-                    f"latency={res['latency']:.2f}s retry_after={res['retry_after']}",
+                    f"latency={res['latency']:.2f}s oom={is_oom(res)}",
                     flush=True,
                 )
 
     total = len(results)
     ok = sum(1 for r in results if r["status"] == 200)
-    busy = sum(1 for r in results if r["status"] == 503)
-    bad = [r for r in results if r["status"] not in (200, 503)]
+    oom = sum(1 for r in results if is_oom(r))
+    bad = [r for r in results if r["status"] != 200 and not is_oom(r)]
     success_rate = ok / total if total else 0.0
     verdict = "PASS" if not bad and success_rate >= args.min_success else "FAIL"
 
     print(
-        f"\n{verdict}: {ok}/{total} ok, {busy} busy(503), {len(bad)} failed, "
+        f"\n{verdict}: {ok}/{total} ok, {oom} oom(500), {len(bad)} failed, "
         f"success_rate={success_rate:.2f} (min {args.min_success})"
     )
     for r in bad:
