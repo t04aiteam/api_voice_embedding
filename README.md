@@ -93,6 +93,20 @@ production, recalibrate against real recordings from your deployment
 python scripts/calibrate.py --input-dir /path/to/background_audio
 ```
 
+The threshold only makes sense together with the calibration state. Measured
+with `evals/threshold_eval.py` on VIVOS (19 test speakers, 380 clips of 3 to
+10 s, CPU, `MODEL_REVISION` above):
+
+| calibration | score range, same speaker | score range, different speakers | 0.70 | 0.96 | best cut (EER) |
+|---|---|---|---|---|---|
+| zero vector as shipped | 0.97 to 1.00 | 0.90 to 0.99 | accepts every pair | 0 % false reject, 38 % false accept | 0.98, 3.5 % |
+| mean of 12 other speakers | 0.33 to 0.94 | -0.38 to 0.79 | 17.5 % false reject, 1.4 % false accept | rejects every pair | 0.63, 9.6 % |
+
+So `0.70` (README, manual) assumes `scripts/calibrate.py` has been run, and
+`0.96` (the code and `.env.example` default) is a raw-score threshold for the
+shipped zero vector. Pick one pair and keep `DEFAULT_THRESHOLD` and the
+calibration file in step.
+
 Enrolled speaker embeddings live under `data/speakers/` (`{speaker_id}.npy`,
 one row per enrolled sample) — back this directory up if needed.
 
@@ -184,6 +198,12 @@ python -m unittest discover -s tests -v
 # 200 or an "out of memory" 500, never any other error, and at least
 # --min-success of them 200.
 python evals/eval_oom.py /path/to/long.mp3 --url http://localhost:6422 --concurrency 4 --rounds 2
+
+# Threshold eval (real model, no service): false accept / false reject at each
+# threshold over a folder with one sub-folder per speaker, with the shipped
+# calibration file or with a background mean computed from --calibrate-from.
+python evals/threshold_eval.py --audio-dir vivos/test/waves --thresholds 0.70 0.96
+python evals/threshold_eval.py --audio-dir vivos/test/waves --calibrate-from vivos/train/waves
 ```
 
 ## Project layout
