@@ -11,6 +11,7 @@ import importlib
 import io
 import os
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -493,9 +494,115 @@ class HostMemoryGuardTests(unittest.TestCase):
     def test_meminfo_parsing(self):
         data = "MemTotal:  131072 kB\nMemFree:  10 kB\nMemAvailable:  2048 kB\n"
         with mock.patch("builtins.open", mock.mock_open(read_data=data)):
-            self.assertEqual(model_service._host_memory_available(), 2048 * 1024)
+            self.assertEqual(model_service._meminfo_available(), 2048 * 1024)
         with mock.patch("builtins.open", side_effect=FileNotFoundError):
+            self.assertIsNone(model_service._meminfo_available())
+            self.assertIsNone(model_service._cgroup_memory_available())
             self.assertIsNone(model_service._host_memory_available())
+
+    def test_processor_allocator_error_maps_to_cpu_oom(self):
+        # oom_forced round 1: torch.stft inside the processor hit the allocator
+        # limit before any forward pass and surfaced as a generic 500.
+        class OomProcessor:
+            def __call__(self, waveform, sampling_rate=None):
+                raise RuntimeError(
+                    "[enforce fail at alloc_cpu.cpp:127] err == 0. DefaultCPUAllocator: "
+                    "can't allocate memory: you tried to allocate 48000000 bytes."
+                )
+
+        class BrokenProcessor:
+            def __call__(self, waveform, sampling_rate=None):
+                raise RuntimeError("unknown parameter type")
+
+        model = FakeModel()
+        with ModelServiceState(model, device="cuda"):
+            with mock.patch.object(model_service, "_processor", OomProcessor()):
+                with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
+                    model_service.extract_embedding(WAVE, 16000)
+            self.assertEqual(ctx.exception.device, "cpu")
+            with mock.patch.object(model_service, "_processor", BrokenProcessor()):
+                with self.assertRaises(RuntimeError) as ctx:
+                    model_service.extract_embedding(WAVE, 16000)
+            self.assertNotIsInstance(ctx.exception, model_service.InferenceOutOfMemory)
+        self.assertEqual(model.calls, [], "no forward pass may start")
+
+
+class CgroupMemoryTests(unittest.TestCase):
+    """The guard sees a cgroup v2 cap (docker mem_limit, systemd MemoryMax) below MemAvailable."""
+
+    def _fake_cgroup(self, tmp, limit, current, path="/app.slice/voice.scope"):
+        base = os.path.join(tmp, "cgroup" + path)
+        os.makedirs(base)
+        with open(os.path.join(base, "memory.max"), "w") as f:
+            f.write(f"{limit}\n")
+        with open(os.path.join(base, "memory.current"), "w") as f:
+            f.write(f"{current}\n")
+        proc = os.path.join(tmp, "self_cgroup")
+        with open(proc, "w") as f:
+            f.write(f"0::{path}\n")
+        return [
+            mock.patch.object(
+                model_service, "_CGROUP_ROOT", os.path.join(tmp, "cgroup")
+            ),
+            mock.patch.object(model_service, "_PROC_SELF_CGROUP", proc),
+        ]
+
+    def _with(self, patches, fn):
+        for p in patches:
+            p.start()
+        try:
+            return fn()
+        finally:
+            for p in reversed(patches):
+                p.stop()
+
+    def test_capped_cgroup_reports_headroom(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = self._fake_cgroup(tmp, 3 * 2**30, 2**30)
+            self.assertEqual(
+                self._with(patches, model_service._cgroup_memory_available), 2 * 2**30
+            )
+
+    def test_uncapped_cgroup_is_ignored(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = self._fake_cgroup(tmp, "max", 2**30)
+            self.assertIsNone(
+                self._with(patches, model_service._cgroup_memory_available)
+            )
+
+    def test_usage_over_cap_reports_zero(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = self._fake_cgroup(tmp, 2**30, 2**30 + 5)
+            self.assertEqual(
+                self._with(patches, model_service._cgroup_memory_available), 0
+            )
+
+    def test_guard_takes_the_tighter_of_meminfo_and_cgroup(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = self._fake_cgroup(tmp, 3 * 2**30, 2**30)
+            patches.append(
+                mock.patch.object(
+                    model_service, "_meminfo_available", return_value=80 * 2**30
+                )
+            )
+            self.assertEqual(
+                self._with(patches, model_service._host_memory_available), 2 * 2**30
+            )
+            patches[-1] = mock.patch.object(
+                model_service, "_meminfo_available", return_value=2**20
+            )
+            self.assertEqual(
+                self._with(patches, model_service._host_memory_available), 2**20
+            )
+
+    def test_container_root_cgroup_path(self):
+        # Inside docker with a cgroup namespace /proc/self/cgroup is "0::/" and
+        # the container's own memory.max sits at the cgroup root.
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = self._fake_cgroup(tmp, 4 * 2**30, 0, path="/")
+            self.assertEqual(
+                self._with(patches, model_service._cgroup_memory_available), 4 * 2**30
+            )
 
 
 class AudioLengthCapTests(unittest.TestCase):
@@ -575,6 +682,24 @@ class HttpErrorMappingTests(unittest.TestCase):
         self.assertIn("out of memory on cuda", body["detail"])
         self.assertNotIn("Process", body["detail"])
         self.assertTrue(eval_oom.is_oom({"status": 500, "detail": body}))
+
+    def test_decode_memory_error_is_oom_500_not_400(self):
+        # oom_forced round 2: numpy's MemoryError inside librosa.load was
+        # swallowed by the generic decode branch and answered as a 400 that
+        # blamed the file.
+        err = MemoryError("Unable to allocate 31.8 MiB for an array")
+        with mock.patch.object(audio_service.librosa, "load", side_effect=err):
+            with self.assertRaises(model_service.InferenceOutOfMemory) as ctx:
+                audio_service._decode(wav_bytes(1.5))
+            self.assertEqual(ctx.exception.device, "cpu")
+            r = self.client.post("/compare", files=self.files)
+        self.assertEqual(r.status_code, 500)
+        self.assertIn("out of memory on cpu", r.json()["detail"])
+        with mock.patch.object(
+            audio_service.librosa, "load", side_effect=ValueError("bad")
+        ):
+            r = self.client.post("/compare", files=self.files)
+        self.assertEqual(r.status_code, 400)
 
     def test_embed_oom_is_500(self):
         err = model_service.InferenceOutOfMemory("cpu", MemoryError())

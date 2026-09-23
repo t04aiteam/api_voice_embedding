@@ -12,6 +12,8 @@ import librosa
 import numpy as np
 from fastapi import HTTPException, UploadFile
 
+from services.model import InferenceOutOfMemory
+
 MIN_AUDIO_SECONDS = float(os.getenv("MIN_AUDIO_SECONDS", "1"))
 # Optional cap, off by default: the user manual (HDSD) lists 25 MB as the only
 # size limit. Activation memory grows linearly with duration (measured 7.6 MiB
@@ -30,6 +32,12 @@ def _decode(raw: bytes) -> tuple[np.ndarray, int, float]:
         waveform, sample_rate = librosa.load(
             io.BytesIO(raw), sr=None, mono=True, duration=limit
         )
+    except MemoryError as exc:
+        # Decoding allocates too (a 378 s mp3 decodes to 64 MiB); under memory
+        # pressure numpy raises MemoryError and the generic branch below would
+        # blame the file with a 400 (oom_forced round 2). It is the server's
+        # memory, so it is the OOM 500.
+        raise InferenceOutOfMemory("cpu", exc) from exc
     except Exception as exc:
         raise HTTPException(
             status_code=400,

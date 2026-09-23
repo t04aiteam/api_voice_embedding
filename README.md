@@ -174,13 +174,26 @@ hundred MiB at any moment. The service handles that as follows:
    deep-copied through the GPU, ~50 MB RAM; a 6-minute file takes ~2.6 s on CPU).
 4. Before any CPU pass (fallback or `DEVICE=cpu`) the activation memory is
    estimated from the processor output (160 bytes per input byte, measured)
-   and compared with `MemAvailable` from `/proc/meminfo`. A recording that
-   would not fit is refused as an out-of-memory 500 instead of driving the
-   host into swap and the kernel OOM killer. Skipped where `/proc/meminfo`
-   does not exist.
+   and compared with the smaller of `MemAvailable` from `/proc/meminfo` and
+   the process's cgroup v2 cap (`memory.max - memory.current`: a docker
+   `mem_limit` or a systemd `MemoryMax=`, which the kernel enforces with
+   SIGKILL). A recording that would not fit is refused as an out-of-memory
+   500 instead of driving the host into swap and the kernel OOM killer.
+   Skipped where neither file exists.
 5. Otherwise the client gets **500** with a `detail` that starts with
    `Server out of memory on <device>` (the HDSD manual documents 500 as the
-   only server error). A CPU (host RAM) exhaustion maps the same way.
+   only server error). A CPU (host RAM) exhaustion maps the same way, whether
+   it hits the forward pass, the mel feature extraction (`torch.stft`) or the
+   decoder (numpy `MemoryError` in `librosa.load`); none of them is reported
+   as a 400.
+
+Measured on 222 with `evals/eval_oom_forced.py` (CPU, the 378 s test song,
+the process alone limited with `RLIMIT_AS`, four concurrent requests): every
+request that cannot get memory is a 500 whose detail says out of memory, the
+short requests in between still answer 200, and the same long file answers
+200 once the limit is lifted. With a 3 GB cgroup cap and 80 GB host
+`MemAvailable` the guard refuses the song in 2.2 s; before the cgroup read the
+kernel killed the process (exit 137) and the client got an empty reply.
 
 `MAX_AUDIO_SECONDS` is off by default (`0`), matching the manual where the 25 MB
 upload size is the only limit. Set it to e.g. `600` to reject longer recordings
@@ -198,6 +211,13 @@ python -m unittest discover -s tests -v
 # 200 or an "out of memory" 500, never any other error, and at least
 # --min-success of them 200.
 python evals/eval_oom.py /path/to/long.mp3 --url http://localhost:6422 --concurrency 4 --rounds 2
+
+# Forced host OOM (real model, starts its own CPU instance on --port, Linux
+# only): warms up, caps the instance's address space with prlimit, and checks
+# that a long file is an "out of memory" 500 while short files still get 200,
+# under 4 concurrent requests too, and that the long file passes once the cap
+# is lifted. Nothing outside that one process is limited.
+python evals/eval_oom_forced.py --long /path/to/long.mp3 --short /path/to/short.wav --port 6423
 
 # Threshold eval (real model, no service): false accept / false reject at each
 # threshold over a folder with one sub-folder per speaker, with the shipped
@@ -220,4 +240,6 @@ scripts/calibrate.py             Recompute the calibration vector from real audi
 schemas/voice.py                 Pydantic request/response models
 tests/test_oom.py                Gate tests for OOM retry, CPU fallback, 500 mapping, optional length cap
 evals/eval_oom.py                Memory-pressure eval against a live service
+evals/eval_oom_forced.py         Forces a host OOM on a throwaway CPU instance (RLIMIT_AS) and checks the 500 path
+evals/threshold_eval.py          False accept / false reject per threshold over a speaker-labelled folder
 ```

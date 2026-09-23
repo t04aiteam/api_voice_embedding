@@ -14,12 +14,15 @@ drop to almost nothing at any time):
    local model cache. The copy never touches the GPU: deep-copying a CUDA model
    would allocate the weights on the GPU that just ran out of memory.
 4. Before any CPU pass (fallback or DEVICE=cpu) the activation memory is
-   estimated from the processor output and checked against MemAvailable, so a
-   recording that cannot fit in host RAM fails as one request instead of
-   feeding the kernel's OOM killer on a shared box.
-5. If the fallback is off, or the CPU itself runs out of memory,
-   InferenceOutOfMemory is raised and main.py turns it into HTTP 500 whose
-   detail says "out of memory" (the HDSD manual documents 500 only).
+   estimated from the processor output and checked against the smaller of
+   MemAvailable and the process's cgroup v2 cap (docker mem_limit, systemd
+   MemoryMax), so a recording that cannot fit fails as one request instead
+   of feeding the kernel's OOM killer on a shared box.
+5. If the fallback is off, or the CPU itself runs out of memory (in the
+   forward pass or in feature extraction), InferenceOutOfMemory is raised and
+   main.py turns it into HTTP 500 whose detail says "out of memory" (the HDSD
+   manual documents 500 only). services/audio.py raises the same for a
+   MemoryError while decoding.
 """
 
 import logging
@@ -213,7 +216,12 @@ def _get_cpu_model():
 _CPU_ACTIVATION_BYTES_PER_INPUT_BYTE = 160
 
 
-def _host_memory_available() -> int | None:
+_MEMINFO_PATH = "/proc/meminfo"
+_CGROUP_ROOT = "/sys/fs/cgroup"
+_PROC_SELF_CGROUP = "/proc/self/cgroup"
+
+
+def _meminfo_available() -> int | None:
     """Read MemAvailable from /proc/meminfo.
 
     Returns:
@@ -221,13 +229,54 @@ def _host_memory_available() -> int | None:
         /proc/meminfo cannot be read (non-Linux).
     """
     try:
-        with open("/proc/meminfo") as f:
+        with open(_MEMINFO_PATH) as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
                     return int(line.split()[1]) * 1024
     except (OSError, ValueError, IndexError):
         pass
     return None
+
+
+def _cgroup_memory_available() -> int | None:
+    """Read how much is left under this process's cgroup v2 memory cap.
+
+    A container ``mem_limit`` or a systemd ``MemoryMax=`` caps the process
+    below the host's MemAvailable, and the kernel enforces it with SIGKILL,
+    so the guard has to see it. Measured on 222 (oom_cgroup_before.log): with
+    a 3 GB cap and 80 GB MemAvailable the 378 s song got the process killed.
+
+    Returns:
+        ``memory.max - memory.current`` in bytes, or None when the cgroup has
+        no cap ("max") or the files cannot be read (cgroup v1, non-Linux).
+    """
+    # ponytail: reads the process's own cgroup only; a cap on an ancestor is
+    # not seen. Walk the parents if a deployment nests cgroups.
+    try:
+        with open(_PROC_SELF_CGROUP) as f:
+            path = f.read().strip().split(":", 2)[2]
+        base = _CGROUP_ROOT + path.rstrip("/")
+        with open(base + "/memory.max") as f:
+            limit = f.read().strip()
+        if limit == "max":
+            return None
+        with open(base + "/memory.current") as f:
+            current = int(f.read().strip())
+        return max(int(limit) - current, 0)
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _host_memory_available() -> int | None:
+    """Bytes a CPU pass may allocate: the smaller of host MemAvailable and the cgroup cap.
+
+    Returns:
+        The tighter of the two limits, or None when neither can be read.
+    """
+    values = [
+        v for v in (_meminfo_available(), _cgroup_memory_available()) if v is not None
+    ]
+    return min(values) if values else None
 
 
 def _check_host_memory(inputs: dict) -> None:
@@ -350,7 +399,15 @@ def extract_embedding(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
     """
     model, processor = load_model()
     device = resolve_device()
-    inputs = processor(waveform, sampling_rate=sample_rate)
+    # Feature extraction (mel spectrogram, always on CPU) allocates too; under
+    # memory pressure torch.stft fails with the same allocator error as the
+    # forward pass (oom_forced round 1: it surfaced as a generic 500).
+    try:
+        inputs = processor(waveform, sampling_rate=sample_rate)
+    except (MemoryError, RuntimeError) as err:
+        if _is_cpu_oom(err):
+            raise InferenceOutOfMemory("cpu", err) from err
+        raise
     with _infer_lock:
         cause = None
         for attempt in (1, 2):
