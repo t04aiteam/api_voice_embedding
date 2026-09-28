@@ -1,6 +1,6 @@
 FROM python:3.11-slim
 
-# ffmpeg: mp3/m4a decoding via librosa's audioread backend
+# ffmpeg: decodes video (mp4/mov/mkv/webm) and m4a/aac uploads, see services/audio.py
 # libsndfile1: wav/flac/ogg decoding via soundfile
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg libsndfile1 \

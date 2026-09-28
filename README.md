@@ -20,8 +20,9 @@ network — **no authentication is enforced** on any endpoint.
 ## Prerequisites
 
 - Python 3.11
-- `ffmpeg` on the host/image, only required to decode `mp3`/`m4a` uploads
-  (`wav`/`flac`/`ogg` decode natively via `libsndfile`)
+- `ffmpeg` on the host/image, required for every upload `libsndfile` cannot
+  open: video (`mp4`/`mov`/`mkv`/`webm`, the audio track is used) and
+  `m4a`/`aac`/`wma`. `wav`/`flac`/`ogg`/`mp3` decode in memory without it.
 - A CUDA GPU is optional; the service auto-detects and falls back to CPU
 
 ## Setup
@@ -150,7 +151,7 @@ curl -X POST http://localhost:6422/embed \
 
 | HTTP | Meaning | Resolution |
 |---|---|---|
-| 400 | Cannot decode audio / empty file | Check file format (native: wav/flac/ogg; mp3/m4a need ffmpeg) |
+| 400 | Cannot decode audio / empty file / video without an audio track | Check the file has an audio track (native: wav/flac/ogg/mp3; video and m4a need ffmpeg on the host) |
 | 404 | Speaker not enrolled | Enroll first via `/speakers/enroll` |
 | 413 | File exceeds `MAX_UPLOAD_MB` (25 MB default) | Trim the recording |
 | 422 | Audio shorter than `MIN_AUDIO_SECONDS` (1s), longer than `MAX_AUDIO_SECONDS` when that cap is set, invalid `speaker_id`, or invalid `threshold` | Use a recording of at least 1s; use a valid `speaker_id`/`threshold` |
