@@ -10,6 +10,8 @@ from schemas.voice import (
     DeleteResponse,
     EmbedResponse,
     EnrollResponse,
+    IdentifyMatch,
+    IdentifyResponse,
     SpeakerInfo,
     VerifyResponse,
 )
@@ -21,6 +23,7 @@ from services import store as store_service
 router = APIRouter()
 
 DEFAULT_THRESHOLD = float(os.getenv("DEFAULT_THRESHOLD", "0.96"))
+DEFAULT_TOP_K = 5
 
 
 def _parse_threshold(threshold: Optional[str]) -> float:
@@ -34,6 +37,29 @@ def _parse_threshold(threshold: Optional[str]) -> float:
         ) from exc
     if not (0.0 <= value <= 1.0):
         raise HTTPException(status_code=422, detail="threshold must be between 0 and 1.")
+    return value
+
+
+def _parse_top_k(top_k: Optional[str]) -> int:
+    """Read the top_k form field; blank means the default.
+
+    Args:
+        top_k: Raw form value.
+
+    Returns:
+        A whole number >= 1.
+
+    Raises:
+        HTTPException: 422 when the value is not a whole number >= 1.
+    """
+    if top_k is None or top_k.strip() == "":
+        return DEFAULT_TOP_K
+    try:
+        value = int(top_k)
+    except ValueError:
+        value = 0
+    if value < 1:
+        raise HTTPException(status_code=422, detail="top_k must be a whole number >= 1.")
     return value
 
 
@@ -119,6 +145,54 @@ async def verify_speaker(
         threshold=thr,
         verified=similarity >= thr,
         samples=int(stored.shape[0]),
+    )
+
+
+@router.post("/speakers/identify", response_model=IdentifyResponse)
+async def identify_speaker(
+    file: UploadFile = File(..., description="Recording to identify (>= 1s)."),
+    top_k: Optional[str] = Form(None, description="Most matches returned; default 5."),
+    threshold: Optional[str] = Form(None, description="Decision threshold; default 0.96."),
+):
+    """Match a recording against every enrolled speaker (1:N), best first.
+
+    Candidates below the threshold stay in the list with verified=false, so a
+    UC 68/69 screen can show them. Nobody enrolled gives an empty list; the file
+    is still decoded, so a bad upload is a 400 either way.
+
+    Args:
+        file: Recording to identify.
+        top_k: Most matches returned, blank for 5.
+        threshold: Decision threshold, blank for DEFAULT_THRESHOLD.
+
+    Returns:
+        The query duration, the threshold used and the ranked matches.
+    """
+    thr = _parse_threshold(threshold)
+    k = _parse_top_k(top_k)
+    waveform, sample_rate, duration = await audio_service.read_and_decode(file)
+    gallery = store_service.centroids()
+    scored = []
+    if gallery:
+        probe = await _embed_calibrated(waveform, sample_rate)
+        scored = sorted(
+            (
+                (calibration_service.cosine_similarity(probe, centroid), speaker_id)
+                for speaker_id, centroid in gallery.items()
+            ),
+            key=lambda pair: (-pair[0], pair[1]),
+        )[:k]
+    return IdentifyResponse(
+        query_duration_seconds=round(duration, 3),
+        threshold=thr,
+        matches=[
+            IdentifyMatch(
+                speaker_id=speaker_id,
+                similarity=round(similarity, 6),
+                verified=similarity >= thr,
+            )
+            for similarity, speaker_id in scored
+        ],
     )
 
 

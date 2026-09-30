@@ -67,6 +67,25 @@ def list_speakers() -> list[dict]:
     return result
 
 
+def centroids() -> dict[str, np.ndarray]:
+    """Map every enrolled speaker to the mean of its stored embeddings.
+
+    The same centroid /speakers/{id}/verify scores against, so identify and
+    verify give one score for one file and one person.
+
+    Returns:
+        speaker_id to centroid, in speaker_id order.
+    """
+    # ponytail: reads every .npy on each call, fine to a few thousand speakers;
+    # keep centroids in memory (invalidated by enroll/delete) if identify gets slow.
+    _ensure_data_dir()
+    return {
+        name[: -len(".npy")]: np.load(os.path.join(DATA_DIR, name)).mean(axis=0)
+        for name in sorted(os.listdir(DATA_DIR))
+        if name.endswith(".npy")
+    }
+
+
 def delete(speaker_id: str) -> bool:
     path = _path(speaker_id)
     with _lock:

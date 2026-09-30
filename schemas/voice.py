@@ -36,6 +36,18 @@ class DeleteResponse(BaseModel):
     deleted: bool
 
 
+class IdentifyMatch(BaseModel):
+    speaker_id: str
+    similarity: float
+    verified: bool
+
+
+class IdentifyResponse(BaseModel):
+    query_duration_seconds: float
+    threshold: float
+    matches: list[IdentifyMatch]
+
+
 class EmbedResponse(BaseModel):
     embedding: list[float]
     dim: int

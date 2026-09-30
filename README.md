@@ -5,10 +5,13 @@ voice verification, backed by
 [marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B](https://huggingface.co/marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B)
 (an ECAPA-TDNN encoder, ~12.2M parameters, extracted from Qwen3-TTS).
 
-Two use cases:
+Use cases:
 - **1:1 comparison** — do two recordings belong to the same speaker (`POST /compare`).
-- **1:N verification** — enroll speakers, then check a new recording against an
-  enrolled identity (`POST /speakers/enroll`, `POST /speakers/{speaker_id}/verify`).
+- **1:1 against an enrolled speaker**: enroll speakers, then check a new
+  recording against one enrolled identity (`POST /speakers/enroll`,
+  `POST /speakers/{speaker_id}/verify`).
+- **1:N identification**: rank every enrolled speaker against a new recording
+  (`POST /speakers/identify`, UC 68).
 
 Decision is a cosine similarity on a *calibrated* embedding (raw embedding minus a
 background mean vector, then L2-normalized); "same speaker" when
@@ -120,10 +123,33 @@ one row per enrolled sample) — back this directory up if needed.
 | POST | `/speakers/enroll` | `speaker_id` (Text), `file` (File) | `{"speaker_id", "samples"}` |
 | POST | `/speakers/{speaker_id}/verify` | `file` (File), `threshold` (Text, optional) | `{"speaker_id", "similarity", "threshold", "verified", "samples"}` |
 | GET | `/speakers` | — | `[{"speaker_id", "samples"}, ...]` |
+| POST | `/speakers/identify` | `file` (File), `top_k` (Text, optional, default 5), `threshold` (Text, optional) | `{"query_duration_seconds", "threshold", "matches": [{"speaker_id", "similarity", "verified"}]}` |
 | DELETE | `/speakers/{speaker_id}` | — | `{"speaker_id", "deleted"}` |
 | POST | `/embed` | `file` (File), `raw` (Text, optional: `true`/`false`, default `false`) | `{"embedding", "dim", "duration_seconds"}` |
 
 `speaker_id` must be 1–64 characters: letters, digits, `.`, `_`, `-`.
+
+`/speakers/identify` scores the recording against the centroid of each enrolled
+speaker's samples (the same score `/verify` gives for that person) and returns
+the `top_k` best, highest first, ties by `speaker_id`. Candidates below the
+threshold stay in the list with `verified: false`; nobody enrolled gives
+`matches: []` with 200. The file is decoded either way, so a bad upload is a
+400 even with an empty store.
+
+Measured with `evals/identify_eval.py` on VIVOS (19 enrolled speakers, 3
+samples each, 190 queries from them, 120 queries from 12 speakers never
+enrolled, CPU, zero calibration vector as shipped):
+
+| | value |
+|---|---|
+| right person first (rank-1) | 99.5 % (189/190) |
+| right person in the top 5 | 100 % |
+| never-enrolled voice verified at 0.96 / 0.97 / 0.98 / 0.99 | 99.2 % / 90.8 % / 34.2 % / 0 % |
+| enrolled voice verified as the right person at 0.96 / 0.98 / 0.99 | 99.5 % / 99.5 % / 77.9 % |
+| equal-error cut (missed = false match) | 0.986, 4.2 % |
+
+So the ranking is reliable, while `verified` at the default threshold is not:
+at 0.96 almost any voice matches someone. See the calibration table above.
 
 ### curl examples
 
@@ -141,6 +167,9 @@ curl -X POST http://localhost:6422/speakers/nguyenvana/verify \
 
 curl http://localhost:6422/speakers
 
+curl -X POST http://localhost:6422/speakers/identify \
+  -F "file=@probe.wav" -F "top_k=5"
+
 curl -X DELETE http://localhost:6422/speakers/nguyenvana
 
 curl -X POST http://localhost:6422/embed \
@@ -154,7 +183,7 @@ curl -X POST http://localhost:6422/embed \
 | 400 | Cannot decode audio / empty file / video without an audio track | Check the file has an audio track (native: wav/flac/ogg/mp3; video and m4a need ffmpeg on the host) |
 | 404 | Speaker not enrolled | Enroll first via `/speakers/enroll` |
 | 413 | File exceeds `MAX_UPLOAD_MB` (25 MB default) | Trim the recording |
-| 422 | Audio shorter than `MIN_AUDIO_SECONDS` (1s), longer than `MAX_AUDIO_SECONDS` when that cap is set, invalid `speaker_id`, or invalid `threshold` | Use a recording of at least 1s; use a valid `speaker_id`/`threshold` |
+| 422 | Audio shorter than `MIN_AUDIO_SECONDS` (1s), longer than `MAX_AUDIO_SECONDS` when that cap is set, invalid `speaker_id`, `threshold` or `top_k` | Use a recording of at least 1s; use a valid `speaker_id`/`threshold`/`top_k` (whole number >= 1) |
 | 500 | Server error | Check the service's terminal/log output. If `detail` says "out of memory", retry later, send a shorter recording, or free GPU memory held by other processes; otherwise the response only names the exception type |
 
 ## Memory
@@ -225,6 +254,13 @@ python evals/eval_oom_forced.py --long /path/to/long.mp3 --short /path/to/short.
 # calibration file or with a background mean computed from --calibrate-from.
 python evals/threshold_eval.py --audio-dir vivos/test/waves --thresholds 0.70 0.96
 python evals/threshold_eval.py --audio-dir vivos/test/waves --calibrate-from vivos/train/waves
+
+# Identify eval (HTTP, a running test instance with its own empty store): enrolls
+# --gallery-dir speakers, queries them and never-enrolled --impostor-dir speakers,
+# reports rank-1, top-k hit and open-set rates per threshold, cleans up.
+SPEAKER_DATA_DIR=/tmp/identify-eval/speakers DEVICE=cpu PORT=6423 python main.py &
+python evals/identify_eval.py --url http://127.0.0.1:6423 --gallery-dir vivos/test/waves \
+    --impostor-dir vivos/train/waves --json /tmp/identify-eval/identify.json
 ```
 
 ## Project layout
@@ -243,4 +279,6 @@ tests/test_oom.py                Gate tests for OOM retry, CPU fallback, 500 map
 evals/eval_oom.py                Memory-pressure eval against a live service
 evals/eval_oom_forced.py         Forces a host OOM on a throwaway CPU instance (RLIMIT_AS) and checks the 500 path
 evals/threshold_eval.py          False accept / false reject per threshold over a speaker-labelled folder
+evals/identify_eval.py           1:N rank-1 and open-set rates of /speakers/identify over HTTP
+tests/test_identify.py           Gate tests for /speakers/identify (shape, order, top_k, threshold, verify parity)
 ```
