@@ -530,13 +530,18 @@ class HostMemoryGuardTests(unittest.TestCase):
 class CgroupMemoryTests(unittest.TestCase):
     """The guard sees a cgroup v2 cap (docker mem_limit, systemd MemoryMax) below MemAvailable."""
 
-    def _fake_cgroup(self, tmp, limit, current, path="/app.slice/voice.scope"):
+    def _fake_cgroup(
+        self, tmp, limit, current, path="/app.slice/voice.scope", inactive_file=None
+    ):
         base = os.path.join(tmp, "cgroup" + path)
         os.makedirs(base)
         with open(os.path.join(base, "memory.max"), "w") as f:
             f.write(f"{limit}\n")
         with open(os.path.join(base, "memory.current"), "w") as f:
             f.write(f"{current}\n")
+        if inactive_file is not None:
+            with open(os.path.join(base, "memory.stat"), "w") as f:
+                f.write(f"anon 4096\nfile {inactive_file + 4096}\ninactive_file {inactive_file}\n")
         proc = os.path.join(tmp, "self_cgroup")
         with open(proc, "w") as f:
             f.write(f"0::{path}\n")
@@ -561,6 +566,19 @@ class CgroupMemoryTests(unittest.TestCase):
             patches = self._fake_cgroup(tmp, 3 * 2**30, 2**30)
             self.assertEqual(
                 self._with(patches, model_service._cgroup_memory_available), 2 * 2**30
+            )
+
+    def test_page_cache_counts_as_headroom(self):
+        # c09 E2E runs 24-26 (2026-10-23): right after the install unpacked 25 GB, the
+        # container's 48 GiB memory.current was 47 GiB, 44 GiB of it page cache, and
+        # the guard refused a 5 s /compare as out of memory. The kernel reclaims
+        # inactive file pages before it OOM-kills, so they count as free.
+        with tempfile.TemporaryDirectory() as tmp:
+            patches = self._fake_cgroup(
+                tmp, 48 * 2**30, 47 * 2**30, inactive_file=40 * 2**30
+            )
+            self.assertEqual(
+                self._with(patches, model_service._cgroup_memory_available), 41 * 2**30
             )
 
     def test_uncapped_cgroup_is_ignored(self):

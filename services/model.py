@@ -246,9 +246,15 @@ def _cgroup_memory_available() -> int | None:
     so the guard has to see it. Measured on 222 (oom_cgroup_before.log): with
     a 3 GB cap and 80 GB MemAvailable the 378 s song got the process killed.
 
+    memory.current also counts page cache, which a large file copy fills to the
+    cap; the kernel reclaims inactive file pages before it OOM-kills, so they
+    are left out (the working set, as cAdvisor computes it). Without memory.stat
+    the whole of memory.current counts.
+
     Returns:
-        ``memory.max - memory.current`` in bytes, or None when the cgroup has
-        no cap ("max") or the files cannot be read (cgroup v1, non-Linux).
+        ``memory.max - (memory.current - inactive_file)`` in bytes, or None when
+        the cgroup has no cap ("max") or the files cannot be read (cgroup v1,
+        non-Linux).
     """
     # ponytail: reads the process's own cgroup only; a cap on an ancestor is
     # not seen. Walk the parents if a deployment nests cgroups.
@@ -262,6 +268,14 @@ def _cgroup_memory_available() -> int | None:
             return None
         with open(base + "/memory.current") as f:
             current = int(f.read().strip())
+        try:
+            with open(base + "/memory.stat") as f:
+                for line in f:
+                    if line.startswith("inactive_file "):
+                        current -= int(line.split()[1])
+                        break
+        except OSError:
+            pass
         return max(int(limit) - current, 0)
     except (OSError, ValueError, IndexError):
         return None
