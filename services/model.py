@@ -1,7 +1,6 @@
 """Model loading and embedding extraction for the Qwen3 ECAPA-TDNN voice encoder.
 
-The model is loaded exactly once (see load_model, invoked from main.py's lifespan
-startup hook) and reused for every request.
+The service warms the model at startup and can unload it after inactivity.
 
 Out-of-memory handling (the GPU is shared with other jobs, so free memory can
 drop to almost nothing at any time):
@@ -25,6 +24,7 @@ drop to almost nothing at any time):
    MemoryError while decoding.
 """
 
+import gc
 import logging
 import os
 import threading
@@ -32,6 +32,8 @@ import threading
 import numpy as np
 import torch
 from transformers import AutoModel, AutoProcessor
+
+from services.idle import IdleModel
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +166,23 @@ def load_model():
         )
         _model = _load_pretrained_model().to(device)
         return _model, _processor
+
+
+def unload_model():
+    """Release the primary model and the optional CPU fallback while idle."""
+    global _model, _processor, _cpu_model
+    with _load_lock, _cpu_model_lock:
+        _model = _processor = _cpu_model = None
+    gc.collect()
+    if torch.cuda.is_initialized():
+        torch.cuda.empty_cache()
+
+
+idle_model = IdleModel(
+    load_model,
+    unload_model,
+    int(os.getenv("MODEL_IDLE_SECONDS", "0")),
+)
 
 
 def get_model():

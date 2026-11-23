@@ -33,7 +33,7 @@ MODEL_ID = os.getenv("MODEL_ID", "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Warm the model up once at startup, not per request.
+    """Warm the model at startup and manage its idle lifetime.
 
     Args:
         app: The FastAPI application being started.
@@ -41,8 +41,8 @@ async def lifespan(app: FastAPI):
     Yields:
         Control to the running application.
     """
-    model_service.load_model()
-    yield
+    async with model_service.idle_model.lifespan():
+        yield
 
 
 app = FastAPI(
@@ -62,7 +62,7 @@ async def health():
         The health payload.
     """
     return HealthResponse(
-        status="ok", model=MODEL_ID, device=model_service.resolve_device()
+        status="ok", model=MODEL_ID, device="cuda" if os.getenv("TTS_GPU_FRONTEND") == "1" else model_service.resolve_device()
     )
 
 

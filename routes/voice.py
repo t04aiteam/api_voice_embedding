@@ -1,5 +1,4 @@
 """/embed, /compare, /speakers... — see README.md for the full endpoint reference."""
-import asyncio
 import os
 from typing import Optional
 
@@ -86,7 +85,7 @@ def _require_enrolled(speaker_id: str) -> None:
 
 
 async def _embed_calibrated(waveform, sample_rate):
-    raw = await asyncio.to_thread(model_service.extract_embedding, waveform, sample_rate)
+    raw = await model_service.idle_model.run(model_service.extract_embedding, waveform, sample_rate)
     return calibration_service.calibrate_embedding(raw)
 
 
@@ -221,7 +220,7 @@ async def embed(
     """Return the 2048-d speaker embedding for a recording, for integration
     with other systems."""
     waveform, sample_rate, duration = await audio_service.read_and_decode(file)
-    raw_embedding = await asyncio.to_thread(
+    raw_embedding = await model_service.idle_model.run(
         model_service.extract_embedding, waveform, sample_rate
     )
     embedding = (
