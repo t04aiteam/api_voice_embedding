@@ -196,7 +196,7 @@ files one after the other, so its peak is the longer file, not the sum.
 When the GPU is shared with other jobs the free memory can drop to a few
 hundred MiB at any moment. The service handles that as follows:
 
-1. Inference is serialized (one forward pass at a time), so concurrent requests
+1. IdleModel runs one inference at a time, so concurrent requests
    queue instead of multiplying peak memory.
 2. On CUDA OOM the caching allocator is flushed and the forward pass retried once.
 3. If it still fails and `CPU_FALLBACK_ON_OOM=1` (default), the request runs on
