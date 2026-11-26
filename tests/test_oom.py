@@ -7,6 +7,7 @@ Run:
     emb-env/bin/python -m unittest discover -s tests -v
 """
 
+import asyncio
 import importlib
 import io
 import os
@@ -738,6 +739,24 @@ class HttpErrorMappingTests(unittest.TestCase):
             r = self.client.post("/compare", files=self.files)
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.json()["same_speaker"])
+
+
+class ConcurrentRequestsTests(unittest.IsolatedAsyncioTestCase):
+    async def test_overlapping_requests_run_one_forward_pass_at_a_time(self):
+        """One pass at a time keeps peak GPU memory at one request (9540308)."""
+        model = FakeModel(delay=0.05)
+        with ModelServiceState(model):
+            async with model_service.idle_model.lifespan(preload=True):
+                await asyncio.gather(
+                    *(
+                        model_service.idle_model.run(
+                            model_service.extract_embedding, WAVE, 16000
+                        )
+                        for _ in range(4)
+                    )
+                )
+        self.assertEqual(len(model.calls), 4)
+        self.assertEqual(model.max_active, 1)
 
 
 if __name__ == "__main__":
