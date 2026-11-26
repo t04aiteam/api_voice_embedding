@@ -450,7 +450,6 @@ def extract_embedding(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
                 raise InferenceOutOfMemory(device, err) from err
             else:
                 raise
-        # Outside the except block, so the flush sees the freed activations.
         _release_cuda_cache()
         if attempt == 1:
             logger.warning(
