@@ -5,7 +5,7 @@ The service warms the model at startup and can unload it after inactivity.
 Out-of-memory handling (the GPU is shared with other jobs, so free memory can
 drop to almost nothing at any time):
 
-1. Inference is serialized through a lock, so peak memory is one request's
+1. IdleModel runs one inference at a time, so peak memory is one request's
    activations, never N concurrent requests' worth.
 2. On CUDA OOM the cached allocator is flushed and the forward pass retried once.
 3. If it still fails and CPU_FALLBACK_ON_OOM is on (default), the request runs
@@ -75,10 +75,6 @@ _model = None
 _cpu_model = None
 _load_lock = threading.Lock()
 _cpu_model_lock = threading.Lock()
-# ponytail: one global lock, so every request queues behind the running forward
-# pass (2.6 s per 6-minute file on CPU). Bounded semaphore + early 500 when the
-# queue is deep if latency under bursts matters.
-_infer_lock = threading.Lock()
 
 
 class InferenceOutOfMemory(RuntimeError):
@@ -441,27 +437,26 @@ def extract_embedding(waveform: np.ndarray, sample_rate: int) -> np.ndarray:
         if _is_cpu_oom(err):
             raise InferenceOutOfMemory("cpu", err) from err
         raise
-    with _infer_lock:
-        cause = None
-        for attempt in (1, 2):
-            try:
-                return _forward(model, inputs, device)
-            except (MemoryError, RuntimeError) as err:
-                if _is_cuda_oom(err):
-                    # Drop the traceback: it pins the failed pass's frames and
-                    # their CUDA tensors, which must be gone before the flush.
-                    cause = err.with_traceback(None)
-                elif _is_cpu_oom(err):
-                    raise InferenceOutOfMemory(device, err) from err
-                else:
-                    raise
-            # Outside the except block, so the flush sees the freed activations.
-            _release_cuda_cache()
-            if attempt == 1:
-                logger.warning(
-                    "CUDA OOM on %s, flushed the cache, retrying once.", device
-                )
-        if not CPU_FALLBACK_ON_OOM:
-            raise InferenceOutOfMemory(device, cause) from cause
-        logger.warning("CUDA OOM again, running this request on CPU.")
-        return _forward_cpu_fallback(inputs)
+    cause = None
+    for attempt in (1, 2):
+        try:
+            return _forward(model, inputs, device)
+        except (MemoryError, RuntimeError) as err:
+            if _is_cuda_oom(err):
+                # Drop the traceback: it pins the failed pass's frames and
+                # their CUDA tensors, which must be gone before the flush.
+                cause = err.with_traceback(None)
+            elif _is_cpu_oom(err):
+                raise InferenceOutOfMemory(device, err) from err
+            else:
+                raise
+        # Outside the except block, so the flush sees the freed activations.
+        _release_cuda_cache()
+        if attempt == 1:
+            logger.warning(
+                "CUDA OOM on %s, flushed the cache, retrying once.", device
+            )
+    if not CPU_FALLBACK_ON_OOM:
+        raise InferenceOutOfMemory(device, cause) from cause
+    logger.warning("CUDA OOM again, running this request on CPU.")
+    return _forward_cpu_fallback(inputs)

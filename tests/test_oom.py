@@ -368,22 +368,6 @@ class ExtractEmbeddingOomTests(unittest.TestCase):
                 model_service.extract_embedding(WAVE, 16000)
         self.assertNotIsInstance(ctx.exception, model_service.InferenceOutOfMemory)
 
-    def test_inference_is_serialized(self):
-        model = FakeModel(delay=0.05)
-        with ModelServiceState(model):
-            threads = [
-                threading.Thread(
-                    target=model_service.extract_embedding, args=(WAVE, 16000)
-                )
-                for _ in range(4)
-            ]
-            for t in threads:
-                t.start()
-            for t in threads:
-                t.join()
-        self.assertEqual(len(model.calls), 4)
-        self.assertEqual(model.max_active, 1)
-
     def test_import_does_not_change_cuda_alloc_conf(self):
         # The service must not switch the CUDA allocator process-wide; the
         # reported OOM had 28 MiB reserved-but-unallocated, not fragmentation.

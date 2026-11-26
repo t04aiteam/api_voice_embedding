@@ -41,7 +41,7 @@ async def lifespan(app: FastAPI):
     Yields:
         Control to the running application.
     """
-    async with model_service.idle_model.lifespan():
+    async with model_service.idle_model.lifespan(preload=True):
         yield
 
 
